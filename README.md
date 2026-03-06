@@ -27,10 +27,10 @@ yocto-project
 ## Requirements
 
 Before using this project make sure you have:
-
+### Linux / WSL environment recommended
 * Docker Desktop installed
 * Git installed
-* Linux / WSL environment recommended
+
 
 Test Docker installation:
 
