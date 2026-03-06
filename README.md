@@ -28,9 +28,85 @@ yocto-project
 
 Before using this project make sure you have:
 ### Linux / WSL environment recommended
-* Docker Desktop installed
-* Git installed
 
+**Step 1: Open PowerShell as Administrator**
+* Click Start Menu
+* Search for PowerShell
+* Right-click Windows PowerShell
+* Select Run as Administrator
+
+**Step 2: Install WSL**
+Run the following command:
+```
+wsl --install
+```
+
+This command will:
+* Enable WSL
+* Enable the Virtual Machine Platform
+* Install the default Linux distribution (Ubuntu)
+
+**Step 3: Restart the Computer**
+After installation finishes, restart the system to complete the setup.
+
+**Step 4: Initialize Ubuntu**
+After restarting:
+* Open Ubuntu from the Start Menu
+* Create a Linux username and password when prompted
+```
+Example:
+Username: developer
+Password: ********
+```
+**Step 5: Verify WSL Installation**
+Run the following command in PowerShell or Ubuntu terminal:
+```
+wsl -l -v
+```
+Expected output example:
+```
+NAME      STATE           VERSION
+Ubuntu    Running         2
+```
+This indicates that WSL version 2 is successfully installed.
+
+### Docker Desktop installed
+Installing Docker Desktop
+Step 1: Download Docker Desktop
+Download Docker Desktop from the official website:
+```
+https://www.docker.com/products/docker-desktop/
+```
+Select Docker Desktop for Windows.
+
+Step 2: Install Docker Desktop
+Run the downloaded installer
+During installation, ensure the following option is selected:
+```
+Use WSL 2 instead of Hyper-V
+```
+Click Install
+
+Step 3: Restart the Computer
+Restart your computer after installation.
+
+### Enable Docker Integration with WSL
+
+Open **Docker Desktop**
+Go to **Settings**
+Navigate to:
+```
+Resources → WSL Integration
+```
+Enable:
+```
+Enable integration with my default WSL distro
+Ubuntu
+```
+Click **Apply & Restart**
+
+### Git installed
+.git
 
 Test Docker installation:
 
