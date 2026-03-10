@@ -11,15 +11,51 @@ The repository contains scripts and configuration to automatically clone Poky an
 ```
 yocto-project
 │
-├── Dockerfile          # Docker environment for Yocto build
-├── README.md           # Project documentation
+├── Dockerfile
+├── README.md
+├── .gitignore
 │
 ├── scripts
-│   └── setup.sh        # Clone poky and build docker image
+│   ├── setup.sh
+│   ├── build.sh
+│   └── run-container.sh
 │
-├── conf                # Yocto configuration templates
+├── conf
+│   ├── local.conf.sample
+│   └── bblayers.conf.sample
 │
-└── layers              # Custom project layers
+├── layers
+│   └── meta-rs485
+│       ├── conf
+│       │   └── layer.conf
+│       │
+│       ├── recipes-kernel
+│       │   └── rs485-driver
+│       │       ├── rs485-driver.bb
+│       │       └── files
+│       │           └── rs485_modbus.c
+│       │
+│       └── recipes-app
+│           └── modbus-test
+│               ├── modbus-test.bb
+│               └── files
+│                   └── modbus_test.c
+│
+├── driver
+│   ├── rs485_modbus.c
+│   ├── rs485_modbus.h
+│   ├── modbus_rtu.c
+│   ├── modbus_rtu.h
+│   └── Makefile
+│
+├── userspace
+│   ├── modbus_test.c
+│   └── Makefile
+│
+└── docs
+    ├── architecture.md
+    ├── build_guide.md
+    └── driver_design.md
 ```
 
 ---
