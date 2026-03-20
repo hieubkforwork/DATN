@@ -1,0 +1,39 @@
+# --- 1. QUÉT SẠCH TÀI LIỆU VÀ FILE CÁ NHÂN (Gây ức chế) ---
+README*
+readme*
+LICENSE*
+license*
+MAINTAINERS*
+MEMORIAM
+SECURITY.md
+.templateconf
+documentation/
+scripts/gui/
+
+# --- 2. QUÉT SẠCH HÀNG NẶNG (Build Artifacts) ---
+build/tmp/
+build/sstate-cache/
+build/downloads/
+build/cache/
+*.pyc
+*.pyo
+*.swp
+*~
+
+# --- 3. QUÉT SẠCH FILE BIÊN DỊCH DƯ THỪA ---
+*.o
+*.ko
+*.mod.c
+*.mod
+*.order
+*.symvers
+
+# --- 4. GIỮ LẠI NHỮNG THỨ SỐNG CÒN ĐỂ YOCTO CHẠY ---
+!meta/
+!meta-poky/
+!meta-yocto-bsp/
+!meta-rs485-driver/
+!bitbake/
+!scripts/
+!oe-init-build-env
+!build/conf/*.conf
