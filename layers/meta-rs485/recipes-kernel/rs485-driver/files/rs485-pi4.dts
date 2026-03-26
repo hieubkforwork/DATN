@@ -1,0 +1,21 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2711";
+
+    fragment@0 {
+        target = <&uart1>;
+        __overlay__ {
+            status = "okay";
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            rs485sensor@15 {
+                compatible = "mycompany,rs485-sensorhub";
+                reg = <0x15>;
+                current-speed = <9600>;
+            };
+        };
+    };
+};

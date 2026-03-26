@@ -1,0 +1,5 @@
+poky/
+build/
+tmp/
+sstate-cache/
+downloads/
