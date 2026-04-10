@@ -1,5 +1,19 @@
-poky/
-build/
-tmp/
-sstate-cache/
-downloads/
+# Ignore toàn bộ build
+build/*
+
+# Nhưng giữ lại conf
+!build/conf/
+!build/conf/**
+
+# Giữ lại images
+!build/tmp/
+!build/tmp/deploy/
+!build/tmp/deploy/images/
+!build/tmp/deploy/images/**
+
+# Nhưng vẫn ignore các file nặng trong images (tuỳ chọn)
+*.wic
+*.sdimg
+*.img
+*.ext4
+*.tar.gz
