@@ -1,224 +1,54 @@
-# Yocto Docker Build Environment
+# Hướng dẫn build image Raspberry Pi 4 với dm-verity và SELinux
 
-This project provides a simple environment to build Yocto images using Docker.
+Tài liệu này mô tả quy trình build image cho Raspberry Pi 4 theo flow:
 
-The repository contains scripts and configuration to automatically clone Poky and build a Docker container for the Yocto build system.
+1. `bitbake core-image-minimal`
+2. `wic create secure-rpi4 -e core-image-minimal`
 
----
-
-## Project Structure
-
-```
-yocto-project
-│
-├── Dockerfile
-├── README.md
-├── .gitignore
-│
-├── scripts
-│   ├── setup.sh
-│   ├── build.sh
-│   └── run-container.sh
-│
-├── conf
-│   ├── local.conf.sample
-│   └── bblayers.conf.sample
-│
-├── layers
-│   └── meta-rs485
-│       ├── conf
-│       │   └── layer.conf
-│       │
-│       ├── recipes-kernel
-│       │   └── rs485-driver
-│       │       ├── rs485-driver.bb
-│       │       └── files
-│       │           └── rs485_modbus.c
-│       │
-│       └── recipes-app
-│           └── modbus-test
-│               ├── modbus-test.bb
-│               └── files
-│                   └── modbus_test.c
-│
-├── driver
-│   ├── rs485_modbus.c
-│   ├── rs485_modbus.h
-│   ├── modbus_rtu.c
-│   ├── modbus_rtu.h
-│   └── Makefile
-│
-├── userspace
-│   ├── modbus_test.c
-│   └── Makefile
-│
-└── docs
-    ├── architecture.md
-    ├── build_guide.md
-    └── driver_design.md
-```
+Flow này phù hợp với trường hợp dùng `dm-verity`, vì file `.verity` cần được tạo ra trước khi dùng `wic` để đóng gói image hoàn chỉnh.
 
 ---
 
-## Requirements
+## 1. Môi trường
 
-Before using this project make sure you have:
-### Linux / WSL environment recommended
+### Yêu cầu
+- Yocto/Poky branch `kirkstone`
+- Máy build Linux
+- Raspberry Pi 4
+- Thẻ SD để flash image
 
-**Step 1: Open PowerShell as Administrator**
-* Click Start Menu
-* Search for PowerShell
-* Right-click Windows PowerShell
-* Select Run as Administrator
+### Các layer đang dùng
+Ví dụ:
 
-**Step 2: Install WSL**
-Run the following command:
-```
-wsl --install
-```
-
-This command will:
-* Enable WSL
-* Enable the Virtual Machine Platform
-* Install the default Linux distribution (Ubuntu)
-
-**Step 3: Restart the Computer**
-After installation finishes, restart the system to complete the setup.
-
-**Step 4: Initialize Ubuntu**
-After restarting:
-* Open Ubuntu from the Start Menu
-* Create a Linux username and password when prompted
-```
-Example:
-Username: developer
-Password: ********
-```
-**Step 5: Verify WSL Installation**
-Run the following command in PowerShell or Ubuntu terminal:
-```
-wsl -l -v
-```
-Expected output example:
-```
-NAME      STATE           VERSION
-Ubuntu    Running         2
-```
-This indicates that WSL version 2 is successfully installed.
-
-### Docker Desktop installed
-Installing Docker Desktop
-Step 1: Download Docker Desktop
-Download Docker Desktop from the official website:
-```
-https://www.docker.com/products/docker-desktop/
-```
-Select Docker Desktop for Windows.
-
-Step 2: Install Docker Desktop
-Run the downloaded installer
-During installation, ensure the following option is selected:
-```
-Use WSL 2 instead of Hyper-V
-```
-Click Install
-
-Step 3: Restart the Computer
-Restart your computer after installation.
-
-### Enable Docker Integration with WSL
-
-Open **Docker Desktop**
-Go to **Settings**
-Navigate to:
-```
-Resources → WSL Integration
-```
-Enable:
-```
-Enable integration with my default WSL distro
-Ubuntu
-```
-Click **Apply & Restart**
-
-### Git installed
-.git
-
-Test Docker installation:
-
-```
-docker run hello-world
-```
+- `meta`
+- `meta-poky`
+- `meta-yocto-bsp`
+- `meta-openembedded/meta-oe`
+- `meta-openembedded/meta-python`
+- `meta-security`
+- `meta-selinux`
+- `meta-raspberrypi`
+- `meta-secure-rpi`
 
 ---
 
-## Setup Environment
+## 2. Cấu hình `bblayers.conf`
 
-Clone the repository:
+Đảm bảo đã add đầy đủ các layer cần thiết, đặc biệt:
 
-```
-git clone <repository-url>
-cd yocto-project
-```
+- `meta-oe`
+- `meta-python`
+- `meta-security`
+- `meta-selinux`
+- `meta-raspberrypi`
+- `meta-secure-rpi`
 
-Run the setup script:
+Có thể add bằng lệnh:
 
-```
-./scripts/setup.sh
-```
-
-The script will:
-
-1. Clone the Poky repository
-2. Checkout the `kirkstone` branch
-3. Build the Docker image `yocto-builder`
-
----
-
-## Run Docker Container
-
-After building the image run:
-
-```
-docker run -it --rm \
--v $(pwd)/..:/workspace \
--w /workspace \
-yocto-builder bash
-```
-
-You will enter the container environment.
-
----
-
-## Build Yocto Image
-
-Inside the container:
-
-```
-cd poky
-source oe-init-build-env
-bitbake core-image-minimal
-```
-
-The build output will be located in:
-
-```
-build/tmp/deploy/images/
-```
-
----
-
-## Notes
-
-* The `build/` directory should not be committed to Git.
-* Only project layers and configuration files should be version controlled.
-* Poky is cloned automatically by the setup script.
-
----
-
-## Future Improvements
-
-* Add custom layer `meta-myproject`
-* Add build automation scripts
-* Add CI/CD pipeline for Yocto builds
-
+```bash
+bitbake-layers add-layer ~/Yocto/poky/meta-openembedded/meta-oe
+bitbake-layers add-layer ~/Yocto/poky/meta-openembedded/meta-python
+bitbake-layers add-layer ~/Yocto/poky/meta-security
+bitbake-layers add-layer ~/Yocto/poky/meta-selinux
+bitbake-layers add-layer ~/Yocto/poky/meta-raspberrypi
+bitbake-layers add-layer ~/Yocto/poky/meta-secure-rpi
