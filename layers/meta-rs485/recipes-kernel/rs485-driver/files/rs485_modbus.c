@@ -218,7 +218,6 @@ static int sensorhub_send_request(struct sensorhub_priv *priv,
     memset(priv->rx.buf, 0, sizeof(priv->rx.buf));
     priv->rx.len      = 0;
     priv->rx.expected = 0;
-    reinit_completion(&priv->rx_done);
     spin_unlock_irqrestore(&priv->rx.lock, flags);
 
     /* ---- 2 & 3. Assert DE, then write --------------------------------- */
@@ -226,20 +225,16 @@ static int sensorhub_send_request(struct sensorhub_priv *priv,
 
     written = serdev_device_write(priv->serdev, buf, len,
                                   msecs_to_jiffies(100));
-    if (written < 0) {
-        sh_err(dev, "serdev_device_write failed: %d\n", written);
-        rs485_set_rx_mode(priv, 50);
-        return written;
-    }
-    if ((size_t)written != len) {
-        sh_warn(dev, "partial write: %d of %zu bytes sent\n",
-                written, len);
-    }
 
     sh_dbg(dev, "TX %zu bytes: [%*ph]\n", len, (int)len, buf);
 
     /* ---- 4 & 5. Drain UART, then release bus -------------------------- */
     rs485_set_rx_mode(priv, 200);
+
+    if (written < (int)len) {
+        sh_err(dev, "TX Failed: wrote %d/%zu\n", written, len);
+        return -EIO;
+    }
 
     return 0;
 }
@@ -268,12 +263,12 @@ static int sensorhub_do_poll(struct sensorhub_priv *priv)
     struct device  *dev = &priv->serdev->dev;
     u8              tx_buf[8];
     u8              rx_snap[MODBUS_MAX_FRAME_LEN];
-    u16             regs[MODBUS_REG_COUNT];  /* 8 registers: 500-507 */
+    u16             regs[MODBUS_REG_COUNT];  
     size_t          tx_len, rx_snap_len;
     unsigned long   remaining, flags;
     int             ret;
 
-    /* ---- 1. Build request --------------------------------------------- */
+    /* ---- 1. Build Modbus RTU request frame ---- */
     tx_len = rtu_build_read_regs_request(tx_buf,
                                           MODBUS_SLAVE_ADDR,
                                           MODBUS_FC_READ_HOLDING_REGS,
@@ -284,43 +279,40 @@ static int sensorhub_do_poll(struct sensorhub_priv *priv)
         return -EINVAL;
     }
 
-    /* ---- 2. Transmit -------------------------------------------------- */
-    ret = sensorhub_send_request(priv, tx_buf, tx_len);
-    if (ret) {
-        sh_err(dev, "poll: TX error: %d\n", ret);
-        return ret;
-    }
-
-    serdev_device_wait_until_sent(priv->serdev, msecs_to_jiffies(50));
-
+    /* ---- 2. PREPARE RX BUFFER BEFORE SENDING (CRITICAL FOR AUTOSCAN) ---- 
+     * We reset the completion and clear length BEFORE transmitting to 
+     * catch fast responses from the sensor.
+     */
     spin_lock_irqsave(&priv->rx.lock, flags);
     priv->rx.len = 0;
     priv->rx.expected = 0;
     reinit_completion(&priv->rx_done); 
     spin_unlock_irqrestore(&priv->rx.lock, flags);
 
-    /* ---- 3. Wait for complete response -------------------------------- */
+    /* ---- 3. Transmit request to the sensor ---- */
+    ret = sensorhub_send_request(priv, tx_buf, tx_len);
+    if (ret) {
+        dev_err_ratelimited(dev, "poll: TX error: %d\n", ret);
+        return ret;
+    }
+
+    /* ---- 4. Wait for response with timeout ---- */
     remaining = wait_for_completion_timeout(
                     &priv->rx_done,
                     msecs_to_jiffies(RX_RESPONSE_TIMEOUT_MS));
     if (!remaining) {
-        sh_warn(dev, "poll: response timeout after %lu ms\n",
-                RX_RESPONSE_TIMEOUT_MS);
         priv->err_count++;
         return -ETIMEDOUT;
     }
 
-    /* ---- 4. Snapshot RX buffer ---------------------------------------- */
+    /* ---- 5. Snapshot the RX buffer for processing ---- */
     spin_lock_irqsave(&priv->rx.lock, flags);
     rx_snap_len = priv->rx.len;
     memcpy(rx_snap, priv->rx.buf,
-           min(rx_snap_len, sizeof(rx_snap)));
+            min(rx_snap_len, (size_t)MODBUS_MAX_FRAME_LEN));
     spin_unlock_irqrestore(&priv->rx.lock, flags);
 
-    sh_dbg(dev, "poll: RX snapshot %zu bytes [%*ph]\n",
-           rx_snap_len, (int)rx_snap_len, rx_snap);
-
-    /* ---- 5. Parse + CRC verify ---------------------------------------- */
+    /* ---- 6. Parse and verify CRC of the Modbus frame ---- */
     memset(regs, 0, sizeof(regs));
     ret = rtu_parse_read_regs_response(rx_snap, rx_snap_len,
                                         MODBUS_SLAVE_ADDR,
@@ -333,69 +325,77 @@ static int sensorhub_do_poll(struct sensorhub_priv *priv)
         return ret;
     }
 
-    /* ---- 6. Decode registers and update cache -------------------------
-     * Register map:
-     *   regs[0] reg500 = humidity    ×10 unsigned
-     *   regs[1] reg501 = temperature ×10 signed 
-     *   regs[2] reg502 = noise       — IGNORED
-     *   regs[3] reg503 = PM2.5       actual µg/m³
-     *   regs[4] reg504 = PM10        — IGNORED
-     *   regs[5] reg505 = pressure    ×10 kPa
-     *   regs[6] reg506 = lux HIGH 16 bits
-     *   regs[7] reg507 = lux LOW  16 bits
-     * ----------------------------------------------------------------- */
+    /* ---- 7. Decode registers and update thread-safe cache ---- */
     mutex_lock(&priv->cache_lock);
-
     priv->cache.humidity    = (u32)regs[0];
     priv->cache.temperature = (s32)(s16)regs[1];  
     priv->cache.pm25        = (u32)regs[3];
     priv->cache.pressure    = (u32)regs[5];
     priv->cache.lux         = ((u32)regs[6] << 16) | (u32)regs[7];
-
     mutex_unlock(&priv->cache_lock);
 
     priv->poll_count++;
 
+    /* ---- 8. Log the sensor data (Human Readable Format) ---- */
     sh_info(dev,
         "Poll #%lu - [Status: OK] "
-        "Hum: %u.%u%%RH, Temp: %s%d.%u degC, "
+        "Hum: %u.%u%%RH, Temp: %c%d.%u degC, "
         "PM2.5: %u ug/m3, Pres: %u.%ukPa, Lux: %u Lux\n",
-        priv->poll_count,
-        (u32)(priv->cache.humidity / 10), (u32)(priv->cache.humidity % 10),
-        priv->cache.temperature < 0 ? "-" : "+",
-        (int)(abs(priv->cache.temperature) / 10),
-        (u32)(abs(priv->cache.temperature) % 10),
-        (u32)priv->cache.pm25,
-        (u32)(priv->cache.pressure / 10), (u32)(priv->cache.pressure % 10),
-        (u32)priv->cache.lux);
+        priv->poll_count,                                     /* %lu */
+        (u32)(priv->cache.humidity / 10),                     /* %u  */
+        (u32)(priv->cache.humidity % 10),                     /* %u  */
+        (priv->cache.temperature < 0) ? '-' : '+',            /* %c  */
+        (int)(abs(priv->cache.temperature) / 10),             /* %d  */
+        (u32)(abs(priv->cache.temperature) % 10),             /* %u  */
+        (u32)priv->cache.pm25,                                /* %u  */
+        (u32)(priv->cache.pressure / 10),                     /* %u  */
+        (u32)(priv->cache.pressure % 10),                     /* %u  */
+        (u32)priv->cache.lux);                                /* %u  */
 
     return 0;
 }
 
 /**
- * sensorhub_poll_fn() - kthread main loop
+ * sensorhub_heartbeat_fn() - Heartbeat and Autoscan Connection Loop
+ * * This kthread performs periodic "heartbeat" polls to the RS485 sensor.
+ * It implements an "autoscan" logic to detect if the physical connection 
+ * is established or lost based on Modbus response success.
  *
- * Polls the sensor at POLL_INTERVAL_MS intervals.  Uses
- * msleep_interruptible() so kthread_stop() wakes it immediately
- * instead of waiting up to one full polling period.
- *
- * @data: sensorhub_priv pointer.
- * Return: 0 (always).
+ * @data: pointer to struct sensorhub_priv
  */
 static int sensorhub_poll_fn(void *data)
 {
     struct sensorhub_priv *priv = (struct sensorhub_priv *)data;
     struct device         *dev  = &priv->serdev->dev;
+    unsigned long         prev_poll_count;
 
-    sh_info(dev, "kthread started (interval=%lu ms)\n", POLL_INTERVAL_MS);
+    sh_info(dev, "Heartbeat kthread started\n");
+    prev_poll_count = priv->poll_count;
 
     while (!kthread_should_stop() && atomic_read(&priv->running)) {
+        
         sensorhub_do_poll(priv);
+
+        if (priv->poll_count != prev_poll_count) {
+            priv->fail_count = 0; 
+            if (!priv->last_connected_state) {
+                printk(KERN_ERR "\n[Auto-scan] RS485 CONNECTED (SENSOR ACTIVE)\n");
+                priv->last_connected_state = true;
+            }
+        } 
+        else {
+            priv->fail_count++;
+            
+            if (priv->fail_count >= CON_FAIL_THRESHOLD && priv->last_connected_state) {
+                printk(KERN_ERR "\n[Auto-scan] RS485 DISCONNECTED (SIGNAL LOST)\n");
+                priv->last_connected_state = false;
+                priv->fail_count = 0;
+            }
+        }
+
+        prev_poll_count = priv->poll_count;
         msleep_interruptible(POLL_INTERVAL_MS);
     }
-
-    sh_info(dev, "kthread exiting (polls=%lu errors=%lu)\n",
-            priv->poll_count, priv->err_count);
     return 0;
 }
 
@@ -529,13 +529,13 @@ static ssize_t sensorhub_cdev_read(struct file  *filp,
     mutex_unlock(&priv->cache_lock);
 
     sh_dbg(&priv->serdev->dev,
-           "cdev: read() by PID %d — temp=%d.%u°C hum=%u.%u%%\n",
-           current->pid,
-           snapshot.temperature < 0 ? '-' : '+',
-           abs(snapshot.temperature) / 10,
-           (u32)(abs(snapshot.temperature) % 10),
-           snapshot.humidity / 10,
-           snapshot.humidity % 10);
+        "cdev: read() by PID %d — temp=%c%d.%u°C hum=%u.%u%%\n",
+        current->pid,                          /* %d  */
+        snapshot.temperature < 0 ? '-' : '+',  /* %c  */
+        (int)(abs(snapshot.temperature) / 10), /* %d  */
+        (u32)(abs(snapshot.temperature) % 10), /* %u  */
+        (u32)(snapshot.humidity / 10),         /* %u  */
+        (u32)(snapshot.humidity % 10));        /* %u  */
 
     /* ---- Transfer to user space (no lock held) ------------------------ */
     if (copy_to_user(ubuf, &snapshot, sizeof(snapshot))) {
@@ -698,15 +698,15 @@ static int sensorhub_cdev_create(struct sensorhub_priv *priv)
         goto err_cdev_del;
     }
 
-    /* ---- Step 4: create device node (/dev/sensorhub) ------------------ */
-    priv->cdev_device = device_create(priv->cdev_class,
+    /* ---- Step 4: create device ------------------ */
+    priv->dev = device_create(priv->cdev_class,
                                        serdev_dev,    /* parent */
                                        priv->devno,
                                        priv,          /* drvdata */
                                        DEVICE_NAME);
-    if (IS_ERR(priv->cdev_device)) {
-        ret = PTR_ERR(priv->cdev_device);
-        priv->cdev_device = NULL;
+    if (IS_ERR(priv->dev)) {
+        ret = PTR_ERR(priv->dev);
+        priv->dev = NULL;
         sh_err(serdev_dev, "cdev: device_create failed: %d\n", ret);
         goto err_class_destroy;
     }
@@ -745,9 +745,9 @@ static void sensorhub_cdev_destroy(struct sensorhub_priv *priv)
     struct device *serdev_dev = &priv->serdev->dev;
 
     /* Step 4 reverse: remove /dev/sensorhub */
-    if (priv->cdev_device) {
+    if (priv->dev) {
         device_destroy(priv->cdev_class, priv->devno);
-        priv->cdev_device = NULL;
+        priv->dev = NULL;
         sh_dbg(serdev_dev, "cdev: device node removed\n");
     }
 
@@ -874,7 +874,81 @@ static int sensorhub_configure_uart(struct sensorhub_priv *priv)
 }
 
 /* =========================================================================
- * Section 8 — Probe / Remove
+ * Section 8 — Sysfs Interface (Monitoring Attributes)
+ *
+ * This section creates virtual files in /sys/class/sensorhub/sensorhub/
+ * ========================================================================= */
+
+/**
+ * temp_show() - Returns temperature in decidegrees (e.g., 305 = 30.5°C)
+ */
+static ssize_t temp_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    struct sensorhub_priv *priv = dev_get_drvdata(dev);
+    return sprintf(buf, "%d\n", priv->cache.temperature);
+}
+
+/**
+ * hum_show() - Returns humidity in deci-percent (e.g., 650 = 65.0%RH)
+ */
+static ssize_t hum_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    struct sensorhub_priv *priv = dev_get_drvdata(dev);
+    return sprintf(buf, "%u\n", priv->cache.humidity);
+}
+
+/**
+ * pm25_show() - Returns PM2.5 concentration in ug/m3
+ */
+static ssize_t pm25_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    struct sensorhub_priv *priv = dev_get_drvdata(dev);
+    return sprintf(buf, "%u\n", priv->cache.pm25);
+}
+
+/**
+ * press_show() - Returns atmospheric pressure in hPa/10 (e.g., 1007 = 100.7kPa)
+ */
+static ssize_t press_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    struct sensorhub_priv *priv = dev_get_drvdata(dev);
+    return sprintf(buf, "%u\n", priv->cache.pressure);
+}
+
+/**
+ * lux_show() - Returns light intensity in Lux
+ */
+static ssize_t lux_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    struct sensorhub_priv *priv = dev_get_drvdata(dev);
+    return sprintf(buf, "%u\n", priv->cache.lux);
+}
+
+/* Define the Read-Only attributes */
+static DEVICE_ATTR_RO(temp);
+static DEVICE_ATTR_RO(hum);
+static DEVICE_ATTR_RO(pm25);
+static DEVICE_ATTR_RO(press);
+static DEVICE_ATTR_RO(lux);
+
+/* Group all attributes into a single array */
+static struct attribute *sensorhub_attrs[] = {
+    &dev_attr_temp.attr,
+    &dev_attr_hum.attr,
+    &dev_attr_pm25.attr,
+    &dev_attr_press.attr,
+    &dev_attr_lux.attr,
+    NULL,
+};
+
+/* Create the attribute group structure */
+static const struct attribute_group sensorhub_group = {
+    .name  = NULL, 
+    .attrs = sensorhub_attrs,
+};
+
+/* =========================================================================
+ * Section 9 — Probe / Remove
  *
  * Probe initialisation order (each step is numbered in the code):
  *   1. Allocate sensorhub_priv (devm_kzalloc)
@@ -912,82 +986,62 @@ static int sensorhub_probe(struct serdev_device *serdev)
 
     sh_info(dev, "probe: " DRIVER_NAME " v" DRIVER_VERSION "\n");
 
-    /* ---- 1. Allocate driver context ----------------------------------- */
+    /* ---- 1. Allocate driver context ---- */
     priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
-    if (!priv) {
-        sh_err(dev, "probe: out of memory\n");
-        return -ENOMEM;
-    }
+    if (!priv) return -ENOMEM;
 
     priv->serdev = serdev;
     serdev_device_set_drvdata(serdev, priv);
 
-    /* ---- 2. Parse Device Tree ----------------------------------------- */
+    /* ---- 2. Parse Device Tree ---- */
     ret = sensorhub_parse_dt(priv);
-    if (ret) {
-        sh_err(dev, "probe: Device Tree parsing failed: %d\n", ret);
-        return ret;   /* devm_gpiod_get cleanup is automatic */
-    }
+    if (ret) return ret;
 
-    /* ---- 3. Open serdev port ------------------------------------------ */
+    /* ---- 3. Open serdev port ---- */
     serdev_device_set_client_ops(serdev, &sensorhub_serdev_ops);
-
     ret = serdev_device_open(serdev);
-    if (ret) {
-        sh_err(dev, "probe: serdev_device_open failed: %d\n", ret);
-        return ret;
-    }
+    if (ret) return ret;
 
-    /* ---- 4. Configure UART -------------------------------------------- */
+    /* ---- 4. Configure UART ---- */
     ret = sensorhub_configure_uart(priv);
-    if (ret) {
-        sh_err(dev, "probe: UART configuration failed: %d\n", ret);
-        goto err_serdev_close;
-    }
+    if (ret) goto err_serdev_close;
 
-    /* ---- 5. Initialise synchronisation primitives --------------------- */
+    /* ---- 5. Initialise synchronisation ---- */
     mutex_init(&priv->cache_lock);
     spin_lock_init(&priv->rx.lock);
     init_completion(&priv->rx_done);
     atomic_set(&priv->running, 1);
 
-    memset(&priv->cache, 0, sizeof(priv->cache));
-    priv->rx.len      = 0;
-    priv->rx.expected = 0;
-
-    /* ---- 6. Register character device (/dev/sensorhub) ---------------- */
+    /* ---- 6. Register character device (/dev/sensorhub) ---- */
     ret = sensorhub_cdev_create(priv);
-    if (ret) {
-        sh_err(dev, "probe: cdev registration failed: %d\n", ret);
-        goto err_kthread_stop;
-    }
+    if (ret) goto err_mutex_destroy;
 
-    /* ---- 7. Start background kthread ---------------------------------- */
+    /* ---- 7. Create Sysfs group ---- */
+    ret = sysfs_create_group(&priv->dev->kobj, &sensorhub_group);
+    if (ret) goto err_cdev_destroy;
+
+    /* ---- 8. Start background kthread ---- */
     priv->poll_thread = kthread_run(sensorhub_poll_fn, priv, KTHREAD_NAME);
     if (IS_ERR(priv->poll_thread)) {
         ret = PTR_ERR(priv->poll_thread);
         priv->poll_thread = NULL;
-        sh_err(dev, "probe: kthread_run failed: %d\n", ret);
-        goto err_mutex_destroy;
+        goto err_sysfs_remove;
     }
 
-    sh_info(dev, "probe: kthread '%s' started\n", KTHREAD_NAME);
-
-    sh_info(dev,
-            "probe: driver bound — baud=%u gpio=%s cdev=/dev/%s\n",
-            priv->baud_rate,
-            priv->de_gpio ? "ok" : "n/a",
-            DEVICE_NAME);
-
+    sh_info(dev, "probe: bound - baud=%u cdev=/dev/%s\n", priv->baud_rate, DEVICE_NAME);
     return 0;
 
-    /* ---- Error unwind (reverse of initialisation order) --------------- */
-err_kthread_stop:
-    atomic_set(&priv->running, 0);
-    kthread_stop(priv->poll_thread);
-    priv->poll_thread = NULL;
+/* ---- Error unwind (Reverse Order) ---- */
+
+err_sysfs_remove:
+    sysfs_remove_group(&priv->dev->kobj, &sensorhub_group);
+
+err_cdev_destroy:
+    sensorhub_cdev_destroy(priv);
+
 err_mutex_destroy:
     mutex_destroy(&priv->cache_lock);
+
 err_serdev_close:
     serdev_device_close(serdev);
     return ret;
@@ -1007,14 +1061,20 @@ static void sensorhub_remove(struct serdev_device *serdev)
     struct sensorhub_priv *priv = serdev_device_get_drvdata(serdev);
     struct device         *dev  = &serdev->dev;
 
+    /* --- 1. Remove Sysfs attributes while priv->dev is still valid ----- */
+    if (priv->dev) {
+        sysfs_remove_group(&priv->dev->kobj, &sensorhub_group);
+        sh_dbg(dev, "remove: sysfs group removed\n");
+    }
+
     sh_info(dev, "remove: shutting down "
             "(polls=%lu errors=%lu)\n",
             priv->poll_count, priv->err_count);
 
-    /* ---- 1. Destroy cdev FIRST — no new open() after this point ------- */
+    /* ---- 2. Destroy cdev FIRST — no new open() after this point ------- */
     sensorhub_cdev_destroy(priv);
 
-    /* ---- 2. Stop kthread ---------------------------------------------- */
+    /* ---- 3. Stop kthread ---------------------------------------------- */
     if (priv->poll_thread) {
         atomic_set(&priv->running, 0);
         kthread_stop(priv->poll_thread);
@@ -1022,26 +1082,24 @@ static void sensorhub_remove(struct serdev_device *serdev)
         sh_info(dev, "remove: kthread stopped\n");
     }
 
-    /* ---- 3. Leave DE GPIO in idle RX state (LOW) ---------------------- */
+    /* ---- 4. Leave DE GPIO in idle RX state (LOW) ---------------------- */
     if (!IS_ERR_OR_NULL(priv->de_gpio)) {
         gpiod_set_value_cansleep(priv->de_gpio, 0);
         sh_dbg(dev, "remove: DE GPIO set LOW (idle RX)\n");
-        /* devm_gpiod_get → released automatically by device framework  */
     }
 
-    /* ---- 4. Close the serdev UART port -------------------------------- */
+    /* ---- 5. Close the serdev UART port -------------------------------- */
     serdev_device_close(serdev);
     sh_info(dev, "remove: serdev port closed\n");
 
-    /* ---- 5. Destroy mutex --------------------------------------------- */
+    /* ---- 6. Destroy mutex --------------------------------------------- */
     mutex_destroy(&priv->cache_lock);
 
-    /* priv itself is freed by devm when the device reference drops       */
     sh_info(dev, "remove: " DRIVER_NAME " unbound\n");
 }
 
 /* =========================================================================
- * Section 9 — OF Match Table & Serdev Driver Registration
+ * Section 10 — OF Match Table & Serdev Driver Registration
  * =====================================================================  */
 
 static const struct of_device_id sensorhub_of_match[] = {
@@ -1060,7 +1118,7 @@ static struct serdev_device_driver sensorhub_driver = {
 };
 
 /* =========================================================================
- * Section 10 — Module Init / Exit
+ * Section 11 — Module Init / Exit
  * =====================================================================  */
 
 static int __init sensorhub_init(void)

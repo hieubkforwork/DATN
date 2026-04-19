@@ -43,7 +43,7 @@
 /* -----------------------------------------------------------------------
  * Character Device Node
  * --------------------------------------------------------------------- */
-#define DEVICE_NAME      "sensorhub"
+#define DEVICE_NAME      "hub0"
 #define CLASS_NAME       "sensorhub"
 #define SENSORHUB_MINOR  0
 
@@ -81,9 +81,10 @@
 /* -----------------------------------------------------------------------
  * Polling / kthread
  * --------------------------------------------------------------------- */
-#define POLL_INTERVAL_MS        1000UL
 #define KTHREAD_NAME            "sensorhub_poll"
-#define RX_RESPONSE_TIMEOUT_MS   1500UL
+#define POLL_INTERVAL_MS        800UL
+#define CON_FAIL_THRESHOLD      3
+#define RX_RESPONSE_TIMEOUT_MS   400UL
 
 /* -----------------------------------------------------------------------
  * sensor_data — Decoded Sensor Payload
@@ -144,7 +145,7 @@ struct sensorhub_priv {
     struct cdev             cdev;       /* embedded by value — container_of */
     dev_t                   devno;
     struct class           *cdev_class;
-    struct device          *cdev_device;
+    struct device          *dev;
 
     /* Diagnostics */
     unsigned long           poll_count;
@@ -152,13 +153,18 @@ struct sensorhub_priv {
 
     /* UART config from Device Tree */
     u32                     baud_rate;
+
+    /*Heartbeat Auto-Scan Connection*/
+    bool last_connected_state; 
+    int fail_count;           
 };
 
 /* -----------------------------------------------------------------------
  * Logging helpers
  * --------------------------------------------------------------------- */
 /* rs485_modbus.c — has struct device* */
-#define sh_info(dev, fmt, ...)  dev_info((dev),  fmt, ##__VA_ARGS__)
+#define sh_info(dev, fmt, ...) \
+    printk(KERN_INFO "sensorhub [%s]: " fmt, dev_name(dev), ##__VA_ARGS__)
 #define sh_warn(dev, fmt, ...)  dev_warn((dev),  fmt, ##__VA_ARGS__)
 #define sh_err(dev,  fmt, ...)  dev_err((dev),   fmt, ##__VA_ARGS__)
 #define sh_dbg(dev,  fmt, ...)  dev_dbg((dev),   fmt, ##__VA_ARGS__)
